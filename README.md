@@ -4,6 +4,16 @@
 
 **Amazon Order Status Integration for Home Assistant**
 
+This fork keeps the integration documentation together with a Home Assistant Live Activity example for Amazon order tracking.
+
+**Credits**
+
+* Original integration author: `koconnorgit`
+* Active maintained fork and 2.0 reference implementation: `ichwars/ha-amazon-order-status`
+
+Reference:
+* https://github.com/ichwars/ha-amazon-order-status
+
 The Amazon Order Status integration allows Home Assistant to track your Amazon order emails and provide up-to-date information about delivery status. By connecting directly to your email via IMAP, the integration automatically detects when orders are received, shipped, and delivered, and provides quick links to the order tracking pages.
 
 We obtain this information via email as Amazon does not publish any public API that could be used for order tracking. 
@@ -119,6 +129,45 @@ Amazon Orders – Ordered
 _No orders in this state._
 {% endfor %}
 ```
+
+### Example: Home Assistant Companion Live Activity for iPhone
+
+If you use the Home Assistant Companion app on iPhone, you can map these Amazon order sensors into a per-order Live Activity. The example below starts one Live Activity card for a single order and reuses the order ID as the notification tag.
+
+```yaml
+sequence:
+  - action: notify.mobile_app_omri_s_phone
+    data:
+      title: Amazon Package
+      message: "Out for delivery · {{ order.subject }}"
+      data:
+        tag: "amazon_order_{{ order.order_id | replace('-', '_') }}"
+        live_update: true
+        progress: 3
+        progress_max: 4
+        critical_text: "Out for delivery · #{{ order.order_id[-4:] }}"
+        notification_icon: mdi:truck-fast-outline
+        notification_icon_color: '#FF9800'
+        color: '#FF9800'
+        progress_bar_color: '#FF9800'
+        url: /lovelace/0
+```
+
+To clear the Live Activity after delivery:
+
+```yaml
+sequence:
+  - action: notify.mobile_app_omri_s_phone
+    data:
+      message: clear_notification
+      data:
+        tag: "amazon_order_{{ order.order_id | replace('-', '_') }}"
+```
+
+Notes:
+* Requires the Home Assistant Companion app on the target iPhone.
+* `live_update: true` enables Live Activity updates instead of one-off notifications.
+* Reusing the same `tag` lets later automations update the same order card as it moves from Ordered → Shipped → Out for delivery → Delivered.
 
 Occasionally Amazon ships packages through 3d party couriers and a "Delivered" email is never sent (or drastically delayed).  To account for this, you can manually delete orders from the database.  You can pass the order id to ```amazon_order_status.purge_order``` through dev tools, although it's easier to create a helper and script, and pass values to the script via a button card.
 
