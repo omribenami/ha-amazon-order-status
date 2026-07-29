@@ -8,3 +8,20 @@ purge_order:
       description: The Amazon order number to remove (e.g. 123-4567890-1234567). Copy from sensor attributes.
       required: true
       example: "123-4567890-1234567"
+
+rescan:
+  description: >-
+    Re-read the last N days of Amazon email, ignoring the stored last-check timestamp.
+    Use this to pick up status changes (such as a cancellation) that arrived before the
+    integration was able to recognise them.
+  fields:
+    days:
+      description: How many days of email to re-read (1-90).
+      required: false
+      default: 14
+      example: 14
+      selector:
+        number:
+          min: 1
+          max: 90
+          mode: box

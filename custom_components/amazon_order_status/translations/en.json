@@ -15,7 +15,7 @@
     "step": {
         "init": {
           "title": "Amazon Order Options",
-          "description": "Configure how Home Assistant tracks and processes Amazon order emails.  delivered_retention_days  - How many days should HA track delivered orders?     update_interval - how often should HA check for delivery updates?     imap_folder - Optional email folder to search (leave empty for INBOX)."
+          "description": "Configure how Home Assistant tracks and processes Amazon order emails.  delivered_retention_days  - How many days should HA track delivered orders?     cancelled_retention_days - How many days should HA keep cancelled orders before dropping them?     update_interval - how often should HA check for delivery updates?     imap_folder - Optional email folder to search (leave empty for INBOX)."
         }
     }
   },
@@ -27,6 +27,16 @@
         "order_id": {
           "name": "Order ID",
           "description": "The Amazon order number to remove (e.g. 123-4567890-1234567). You can copy this from the sensor's order list."
+        }
+      }
+    },
+    "rescan": {
+      "name": "Rescan email",
+      "description": "Re-read the last N days of Amazon email, ignoring the stored last-check timestamp. Use this to pick up status changes (such as a cancellation) that arrived before the integration could recognise them.",
+      "fields": {
+        "days": {
+          "name": "Days",
+          "description": "How many days of email to re-read (1-90)."
         }
       }
     }

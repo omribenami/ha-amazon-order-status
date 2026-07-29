@@ -18,7 +18,16 @@ from homeassistant.helpers.storage import Store
 import html
 from bs4 import BeautifulSoup
 
-from .const import CONF_MARK_AS_READ, CONF_IMAP_FOLDER
+from .const import (
+    CONF_CANCELLED_RETENTION_DAYS,
+    CONF_IMAP_FOLDER,
+    CONF_MARK_AS_READ,
+    DEFAULT_CANCELLED_RETENTION_DAYS,
+    EVENT_ORDER_CANCELLED,
+    EVENT_ORDER_REMOVED,
+    STATUS_CANCELLED,
+    STATUS_DELIVERED,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +90,13 @@ STATUS_MAP = {
     "delivered": "Delivered",
 }
 
+# Cancellation subjects vary a lot ("Your Amazon.com order has been canceled",
+# "Cancelled: Your Amazon.com order of ...", "Item(s) canceled from your order",
+# "Your cancellation request"). Match the past tense / noun forms only, so
+# marketing subjects like "Cancel your Prime membership" are not treated as
+# order cancellations.
+CANCEL_SUBJECT_RE = re.compile(r"\bcancell?ed\b|\bcancellation\b", re.IGNORECASE)
+
 def _select_folder(mail: imaplib.IMAP4, folder: str) -> None:
     """Select an IMAP mailbox. Use standard select() when safe; otherwise send SELECT line ourselves.
 
@@ -117,7 +133,12 @@ class AmazonOrdersCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self._orders: Dict[str, dict] = {}
+        # Events collected while parsing in the executor, fired on the event loop
+        self._pending_events: list[tuple[str, dict]] = []
         self.delivered_retention_days = entry.options.get("delivered_retention_days", 7)
+        self.cancelled_retention_days = entry.options.get(
+            CONF_CANCELLED_RETENTION_DAYS, DEFAULT_CANCELLED_RETENTION_DAYS
+        )
         self._mark_as_read = entry.options.get(CONF_MARK_AS_READ, False)
         # Get IMAP folder from options, default to "INBOX" if empty or not set
         folder = entry.options.get(CONF_IMAP_FOLDER, "")
@@ -177,13 +198,50 @@ class AmazonOrdersCoordinator(DataUpdateCoordinator):
             now,
         )
 
-        # Purge old delivered orders
-        self._purge_old_delivered_orders(now)
+        # Purge old delivered and cancelled orders
+        self._purge_old_orders(now)
 
         await self.async_save_state(now)
 
+        self._fire_pending_events()
+
         # Include order_id in each item so sensors and services can use it
         return [{**v, "order_id": k} for k, v in self._orders.items()]
+
+    async def async_rescan(self, days: int) -> None:
+        """Re-parse the last N days of email, ignoring the stored last check.
+
+        Used to pick up status changes (notably cancellations) that arrived
+        before the integration knew how to recognise them.
+        """
+        if not self._orders:
+            await self.async_load_stored_orders()
+
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=max(1, days))
+        _LOGGER.debug("Rescanning Amazon emails since %s", since)
+
+        await self.hass.async_add_executor_job(
+            self._fetch_and_parse_emails,
+            since,
+            now,
+        )
+
+        self.last_check = now
+        self._purge_old_orders(now)
+        await self.async_save_state(now)
+        self._fire_pending_events()
+        self.async_set_updated_data(
+            [{**v, "order_id": k} for k, v in self._orders.items()]
+        )
+
+    @callback
+    def _fire_pending_events(self) -> None:
+        """Fire events queued during email parsing / purging."""
+        pending, self._pending_events = self._pending_events, []
+        for event_type, data in pending:
+            _LOGGER.debug("Firing %s: %s", event_type, data)
+            self.hass.bus.async_fire(event_type, data)
 
     @callback
     def async_update_interval(self, minutes: int):
@@ -197,7 +255,16 @@ class AmazonOrdersCoordinator(DataUpdateCoordinator):
         """Update delivered retention days and immediately purge old delivered orders."""
         self.delivered_retention_days = days
         _LOGGER.debug("Delivered retention days updated to %d", days)
-        self._purge_old_delivered_orders(datetime.now(timezone.utc))
+        self._purge_old_orders(datetime.now(timezone.utc))
+        self._fire_pending_events()
+
+    @callback
+    def async_set_cancelled_retention_days(self, days: int):
+        """Update cancelled retention days and immediately purge old cancelled orders."""
+        self.cancelled_retention_days = days
+        _LOGGER.debug("Cancelled retention days updated to %d", days)
+        self._purge_old_orders(datetime.now(timezone.utc))
+        self._fire_pending_events()
 
     @callback
     def async_set_mark_as_read(self, mark_as_read: bool):
@@ -223,35 +290,64 @@ class AmazonOrdersCoordinator(DataUpdateCoordinator):
         self.hass.config_entries.async_update_entry(self.entry, options=new_options)
 
     @callback
-    def _purge_old_delivered_orders(self, now: datetime):
-        """Remove delivered orders older than retention period."""
+    def _purge_old_orders(self, now: datetime):
+        """Remove delivered and cancelled orders older than their retention period."""
         if not self._orders:
             return
 
-        retention_cutoff = now - timedelta(days=self.delivered_retention_days)
-        to_remove = [
-            order_id
-            for order_id, order in self._orders.items()
-            if order.get("status") == "Delivered"
-            and datetime.fromisoformat(order.get("updated")) < retention_cutoff
-        ]
+        retention_days = {
+            STATUS_DELIVERED: self.delivered_retention_days,
+            STATUS_CANCELLED: self.cancelled_retention_days,
+        }
 
-        for order_id in to_remove:
+        to_remove = []
+        for order_id, order in self._orders.items():
+            days = retention_days.get(order.get("status"))
+            if days is None:
+                continue
+            try:
+                updated = _to_utc(datetime.fromisoformat(order.get("updated")))
+            except (ValueError, TypeError):
+                continue
+            if updated < now - timedelta(days=days):
+                to_remove.append((order_id, order))
+
+        for order_id, order in to_remove:
+            status = order.get("status")
             _LOGGER.debug(
-                "Purging delivered order %s (older than %d days)",
+                "Purging %s order %s (older than %d days)",
+                status.lower() if status else "old",
                 order_id,
-                self.delivered_retention_days,
+                retention_days.get(status, 0),
             )
             self._orders.pop(order_id, None)
+            self._queue_removed_event(order_id, order, reason="retention")
+
+    @callback
+    def _queue_removed_event(self, order_id: str, order: dict, reason: str) -> None:
+        """Queue an order-removed event so automations can clean up after it."""
+        self._pending_events.append(
+            (
+                EVENT_ORDER_REMOVED,
+                {
+                    "order_id": order_id,
+                    "reason": reason,
+                    "status": order.get("status"),
+                    "subject": order.get("subject"),
+                },
+            )
+        )
 
     async def async_purge_order(self, order_id: str) -> bool:
         """Remove a specific order from tracking and persist state. Returns True if removed."""
         if order_id not in self._orders:
             return False
-        self._orders.pop(order_id, None)
+        order = self._orders.pop(order_id)
         _LOGGER.debug("Purged order %s by user request", order_id)
+        self._queue_removed_event(order_id, order, reason="purged")
         now = self.last_check or datetime.now(timezone.utc)
         await self.async_save_state(now)
+        self._fire_pending_events()
         self.async_set_updated_data(
             [{**v, "order_id": k} for k, v in self._orders.items()]
         )
@@ -386,6 +482,19 @@ class AmazonOrdersCoordinator(DataUpdateCoordinator):
                 # Only overwrite if we don't have this order or this email is newer than stored
                 existing = self._orders.get(order_id)
                 if existing:
+                    # A cancelled order stays cancelled. Amazon keeps sending
+                    # shipment/delivery mail for other items on the same order
+                    # number, and reviving it would resurrect the notification.
+                    if (
+                        existing.get("status") == STATUS_CANCELLED
+                        and status != STATUS_CANCELLED
+                    ):
+                        _LOGGER.debug(
+                            "Order %s: ignoring %s email, order is cancelled",
+                            order_id,
+                            status,
+                        )
+                        continue
                     try:
                         existing_updated = _to_utc(
                             datetime.fromisoformat(existing["updated"])
@@ -407,6 +516,22 @@ class AmazonOrdersCoordinator(DataUpdateCoordinator):
                     "tracking_url": tracking_url,
                 }
                 did_update = True
+
+                if status == STATUS_CANCELLED and (
+                    not existing or existing.get("status") != STATUS_CANCELLED
+                ):
+                    self._pending_events.append(
+                        (
+                            EVENT_ORDER_CANCELLED,
+                            {
+                                "order_id": order_id,
+                                "subject": subject,
+                                "previous_status": existing.get("status")
+                                if existing
+                                else None,
+                            },
+                        )
+                    )
                 _LOGGER.debug(
                     "Order %s → %s (%s) [tracking: %s]",
                     order_id,
@@ -422,7 +547,13 @@ class AmazonOrdersCoordinator(DataUpdateCoordinator):
         mail.logout()
 
     def _status_from_subject(self, subject: str) -> str | None:
-        """Determine order status from email subject."""
+        """Determine order status from email subject.
+
+        Cancellation is checked first: a cancellation subject can also contain
+        words like "order" or "delivery" and must not be mapped to a live status.
+        """
+        if CANCEL_SUBJECT_RE.search(subject):
+            return STATUS_CANCELLED
         for key, value in STATUS_MAP.items():
             if key in subject:
                 return value
