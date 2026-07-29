@@ -4,7 +4,12 @@ from homeassistant import config_entries
 import voluptuous as vol
 from homeassistant.helpers import config_validation as cv
 
-from .const import DOMAIN, CONF_IMAP_FOLDER
+from .const import (
+    CONF_CANCELLED_RETENTION_DAYS,
+    CONF_IMAP_FOLDER,
+    DEFAULT_CANCELLED_RETENTION_DAYS,
+    DOMAIN,
+)
 
 
 class AmazonOrderStatusOptionsFlow(config_entries.OptionsFlow):
@@ -32,6 +37,10 @@ class AmazonOrderStatusOptionsFlow(config_entries.OptionsFlow):
                     coordinator.async_set_retention_days(
                         user_input["delivered_retention_days"]
                     )
+                if CONF_CANCELLED_RETENTION_DAYS in user_input:
+                    coordinator.async_set_cancelled_retention_days(
+                        user_input[CONF_CANCELLED_RETENTION_DAYS]
+                    )
                 if "update_interval" in user_input:
                     coordinator.async_update_interval(
                         user_input["update_interval"]
@@ -56,6 +65,13 @@ class AmazonOrderStatusOptionsFlow(config_entries.OptionsFlow):
                 vol.Required(
                     "delivered_retention_days",
                     default=options.get("delivered_retention_days", 30),
+                ): cv.positive_int,
+                vol.Required(
+                    CONF_CANCELLED_RETENTION_DAYS,
+                    default=options.get(
+                        CONF_CANCELLED_RETENTION_DAYS,
+                        DEFAULT_CANCELLED_RETENTION_DAYS,
+                    ),
                 ): cv.positive_int,
                 vol.Required(
                     "update_interval",

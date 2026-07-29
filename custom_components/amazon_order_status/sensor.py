@@ -17,7 +17,12 @@ STATUSES = [
     "Shipped",
     "Out for delivery",
     "Delivered",
+    "Cancelled",
 ]
+
+STATUS_ICONS = {
+    "Cancelled": "mdi:package-variant-closed-remove",
+}
 
 
 async def async_setup_entry(
@@ -45,7 +50,7 @@ class AmazonOrderStatusSensor(CoordinatorEntity, Entity):
         self.status = status
         self._attr_unique_id = f"amazon_order_status_{status.lower().replace(' ', '_')}"
         self._attr_name = f"Amazon Orders {status}"
-        self._attr_icon = "mdi:package-variant"
+        self._attr_icon = STATUS_ICONS.get(status, "mdi:package-variant")
 
     @property
     def state(self) -> int:

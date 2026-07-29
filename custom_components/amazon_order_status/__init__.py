@@ -7,16 +7,31 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
 
-from .const import DOMAIN, SERVICE_PURGE_ORDER, ATTR_ORDER_ID
+from .const import (
+    ATTR_DAYS,
+    ATTR_ORDER_ID,
+    DOMAIN,
+    SERVICE_PURGE_ORDER,
+    SERVICE_RESCAN,
+)
 from .coordinator import AmazonOrdersCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["sensor"]
 DEFAULT_UPDATE_INTERVAL = 5  # minutes
+DEFAULT_RESCAN_DAYS = 14
 
 PURGE_ORDER_SCHEMA = vol.Schema(
     {vol.Optional(ATTR_ORDER_ID, default=""): cv.string}
+)
+
+RESCAN_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_DAYS, default=DEFAULT_RESCAN_DAYS): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=90)
+        )
+    }
 )
 
 
@@ -48,6 +63,26 @@ def _make_purge_order_handler(hass: HomeAssistant):
     return handler
 
 
+async def _handle_rescan(hass: HomeAssistant, call: ServiceCall) -> None:
+    """Re-parse recent Amazon email, ignoring the stored last-check timestamp."""
+    days = call.data.get(ATTR_DAYS, DEFAULT_RESCAN_DAYS)
+    domain_data = hass.data.get(DOMAIN) or {}
+    seen: set[int] = set()
+    for value in domain_data.values():
+        if isinstance(value, AmazonOrdersCoordinator) and id(value) not in seen:
+            seen.add(id(value))
+            await value.async_rescan(days)
+
+
+def _make_rescan_handler(hass: HomeAssistant):
+    """Return an async service handler that closes over hass."""
+
+    async def handler(call: ServiceCall) -> None:
+        await _handle_rescan(hass, call)
+
+    return handler
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Amazon Order Status from a config entry."""
     # Create the coordinator
@@ -63,13 +98,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Also store by entry_id for platform setup
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
-    # Register purge_order service (idempotent if multiple entries)
+    # Register services (idempotent if multiple entries)
     if not hass.services.has_service(DOMAIN, SERVICE_PURGE_ORDER):
         hass.services.async_register(
             DOMAIN,
             SERVICE_PURGE_ORDER,
             _make_purge_order_handler(hass),
             schema=PURGE_ORDER_SCHEMA,
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_RESCAN):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_RESCAN,
+            _make_rescan_handler(hass),
+            schema=RESCAN_SCHEMA,
         )
 
     # Forward entry setups (sensors)
